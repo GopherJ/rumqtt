@@ -58,6 +58,7 @@ pub fn start(id: &str, payload_size: usize, count: usize) -> Result<() , Box<dyn
              payload_size,
              throughput,
     );
+    dbg!(connection.eventloop.blocked_count);
     Ok(())
 }
 

@@ -59,6 +59,7 @@ pub struct EventLoop {
     pub(crate) cancel_tx: Option<Sender<()>>,
     /// Delay between reconnection (after a failure)
     pub(crate) reconnection_delay: Duration,
+    pub blocked_count: usize
 }
 
 impl EventLoop {
@@ -88,6 +89,7 @@ impl EventLoop {
             cancel_rx,
             cancel_tx: Some(cancel_tx),
             reconnection_delay: Duration::from_secs(0),
+            blocked_count: 0
         }
     }
 
@@ -140,76 +142,28 @@ impl EventLoop {
         let throttle = self.options.pending_throttle;
         let pending = self.pending.len() > 0;
 
+        if inflight_full {
+            self.blocked_count += 1;
+        }
+
         select! {
             // Pull a bunch of packets from network, reply in bunch and yield the first item
-            o = network.readb(), if self.buffered.len() == 0 => match o {
+            o = network.read() => match o {
                 Ok(packets) => {
-                    let (incoming, outgoing) = self.state.handle_incoming_packets(packets)?;
-                    self.buffered = incoming.into_iter();
-                    network.writeb(outgoing).await?;
-                    return Ok((self.buffered.next(), None))
+                    let (incoming, _outgoing) = self.state.handle_incoming_packet(packets.into())?;
+                    return Ok((incoming, None))
                 }
                 Err(e) => return Err(ConnectionError::Io(e))
             },
-            // yield the next incoming packet of already (handled) buffered incoming packets
-            o = next_buffered(&mut self.buffered), if self.buffered.len() > 0 => {
-                    return Ok((o, None))
-            }
-            // Pull next request from user requests channel.
-            // If condition in the below branch if for flow control. We read next user request
-            // only when max inflight settings are honoured.
-            // Flow control is based on ack count. As long as number of inflight packets in buffer
-            // are less than max_inflight setting, next request will progress. For this
-            // to work correctly, broker should ack in sequence and any sane broker will do so
-            // If it doesn't, this will result in connection drop. Use should decide
-            // E.g If max inflight = 5, requests will be blocked when inflight queue looks like this
-            // [1, 2, 3, 4, 5]. Assume broker acking 2 instead of 1 -> [1, x, 3, 4, 5]. While
-            // rolling pkid, next packet will be written in 1 (which is unacked) and results in
-            // an error
-            // This can be fixed by using packet id boundary instead of count for flow control.
-            // This trick will make the client robust against brokers which doesn't ack sequentially
-            // at the cost of throughput. Consider an example with max inflight of 5.
-            // Full inflight queue will look like -> [1, 2, 3, 4, 5].
-            // If 3 is acked instead of 1 first -> [1, 2, 4, 5].
-            // If we flow control at boundary (5), Every ack should be received before rolling pkid
-            // and hence overwrites aren't a problem anymore
-            // Also note that, next_packet_id resets to 1 every time inflight packets are acked
-            o = self.requests_rx.next(), if !inflight_full && !pending => match o {
+            o = self.requests_rx.next(), if !inflight_full => match o {
                 Some(request) => {
                     let request = self.state.handle_outgoing_packet(request)?;
                     let outgoing = network.fill(request)?;
-                    // bulk up publish requests
-                    if self.options.max_request_batch > 0 && self.requests_rx.len() > 0 {
-                        bulk_fill(&self.options, &mut self.state, &self.requests_rx, network)?;
-                        network.flush().await?;
-                        // Ids are not available when individual request batching is enabled
-                        return Ok((None, Some(Outgoing::Batch)))
-                    }
-
                     network.flush().await?;
                     return Ok((None, Some(outgoing)))
                 }
                 None => return Err(ConnectionError::RequestsDone),
             },
-            // Handle the next pending packet from previous session. Disable
-            // this branch when done with all the pending packets
-            Some(request) = next_pending(throttle, &mut self.pending), if pending => {
-                let request = self.state.handle_outgoing_packet(request)?;
-                let outgoing = network.write(request).await?;
-                Ok((None, Some(outgoing)))
-            },
-            // We generate pings irrespective of network activity. This keeps the ping logic
-            // simple. We can change this behavior in future if necessary (to prevent extra pings)
-            _ = &mut self.keepalive_timeout => {
-                self.keepalive_timeout.reset(Instant::now() + self.options.keep_alive);
-                let request = self.state.handle_outgoing_packet(Request::PingReq)?;
-                let outgoing = network.write(request).await?;
-                Ok((None, Some(outgoing)))
-            }
-            // cancellation requests to stop the polling
-            _ = self.cancel_rx.next() => {
-                return Err(ConnectionError::Cancel)
-            }
         }
     }
 
